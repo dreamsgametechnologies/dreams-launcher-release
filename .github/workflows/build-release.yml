@@ -9,7 +9,7 @@ name: Launcher Build & Release
 #
 # Flow:
 #   1. Check out the private source at the dispatched commit SHA (via PAT).
-#   2. Build Tauri launcher + bootstrapper for mac-arm64, mac-x64, linux, windows.
+#   2. Build Tauri launcher + bootstrapper for mac-arm64, linux, windows.
 #      BUILD_CHANNEL is set from the dispatch payload so the binary's
 #      build_info::BUILD_CHANNEL constant is baked correctly.
 #   3. Generate + sign the v2 manifest (manifest.json).
@@ -41,10 +41,6 @@ jobs:
           - os: macos-latest
             target_name: macos-arm64
             target_triple: aarch64-apple-darwin
-            archive_ext: tar.gz
-          - os: macos-13
-            target_name: macos-x64
-            target_triple: x86_64-apple-darwin
             archive_ext: tar.gz
           - os: ubuntu-latest
             target_name: linux-x64
@@ -203,23 +199,23 @@ jobs:
             PRERELEASE_FLAG="--prerelease"
           fi
           gh release create "$TAG" \
-            --target "$SOURCE_SHA" \
-            --title  "Dreams Launcher $TAG" \
-            --notes  "Automated release for channel: $CHANNEL (source $SOURCE_SHA)" \
+            --repo  "${{ github.repository }}" \
+            --title "Dreams Launcher $TAG" \
+            --notes "Automated release for channel: $CHANNEL (source $SOURCE_SHA)" \
             $PRERELEASE_FLAG \
             dist/release/* \
-          || gh release upload "$TAG" --clobber dist/release/*
+          || gh release upload "$TAG" --repo "${{ github.repository }}" --clobber dist/release/*
 
       - name: Move rolling tag latest-${{ env.CHANNEL }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ROLLING="latest-$CHANNEL"
-          gh release delete "$ROLLING" --yes --cleanup-tag || true
+          gh release delete "$ROLLING" --repo "${{ github.repository }}" --yes --cleanup-tag || true
           cp dist/release/manifest.json dist/release/latest.json
           gh release create "$ROLLING" \
-            --target "$SOURCE_SHA" \
-            --title  "Latest $CHANNEL" \
-            --notes  "Rolling pointer to $TAG. Updater fetches latest.json from here." \
+            --repo  "${{ github.repository }}" \
+            --title "Latest $CHANNEL" \
+            --notes "Rolling pointer to $TAG. Updater fetches latest.json from here." \
             --prerelease \
             dist/release/latest.json
