@@ -1,0 +1,225 @@
+name: Launcher Build & Release
+
+# This workflow lives in the PUBLIC release repo
+# (dreamsgametechnologies/dreams-launcher-release).
+#
+# It is triggered by a repository_dispatch event of type "launcher-release"
+# sent from the private source repo (dreamsgametechnologies/dreams-launcher) when a
+# v<version>-<channel> tag is pushed there.
+#
+# Flow:
+#   1. Check out the private source at the dispatched commit SHA (via PAT).
+#   2. Build Tauri launcher + bootstrapper for mac-arm64, mac-x64, linux, windows.
+#      BUILD_CHANNEL is set from the dispatch payload so the binary's
+#      build_info::BUILD_CHANNEL constant is baked correctly.
+#   3. Generate + sign the v2 manifest (manifest.json).
+#   4. Publish two releases on this repo:
+#        - v<version>-<channel>  : immutable, hosts platform binaries + manifest.json
+#        - latest-<channel>      : rolling, hosts only latest.json (= manifest.json copy)
+#                                  This is the URL the in-product auto-updater reads.
+
+on:
+  repository_dispatch:
+    types: [launcher-release]
+
+env:
+  CARGO_TERM_COLOR: always
+  SOURCE_REPO: dreamsgametechnologies/dreams-launcher
+  TAG:        ${{ github.event.client_payload.tag }}
+  CHANNEL:    ${{ github.event.client_payload.channel }}
+  VERSION:    ${{ github.event.client_payload.version }}
+  SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+
+jobs:
+  build:
+    name: ${{ matrix.target_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target_name: macos-arm64
+            target_triple: aarch64-apple-darwin
+            archive_ext: tar.gz
+          - os: macos-13
+            target_name: macos-x64
+            target_triple: x86_64-apple-darwin
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            target_name: linux-x64
+            target_triple: x86_64-unknown-linux-gnu
+            archive_ext: AppImage
+          - os: windows-latest
+            target_name: windows-x64
+            target_triple: x86_64-pc-windows-msvc
+            archive_ext: zip
+
+    steps:
+      - name: Checkout source from ${{ env.SOURCE_REPO }} @ ${{ env.SOURCE_SHA }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref:        ${{ env.SOURCE_SHA }}
+          token:      ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target_triple }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+            bootstrapper/target
+          key: ${{ runner.os }}-${{ matrix.target_triple }}-launcher-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev
+
+      - name: Install Node + Yarn
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: corepack enable && yarn install --frozen-lockfile
+
+      - name: Build frontend
+        env:
+          BUILD_CHANNEL: ${{ env.CHANNEL }}
+        run: yarn build
+
+      - name: Build launcher binary (Tauri)
+        env:
+          BUILD_CHANNEL: ${{ env.CHANNEL }}
+        run: |
+          cd src-tauri
+          cargo build --release --target ${{ matrix.target_triple }}
+
+      - name: Build bootstrapper
+        env:
+          BUILD_CHANNEL: ${{ env.CHANNEL }}
+        run: |
+          cd bootstrapper
+          cargo build --release --target ${{ matrix.target_triple }}
+
+      - name: Stage artifacts (mac)
+        if: runner.os == 'macOS'
+        run: |
+          ./scripts/release/stage-mac.sh \
+            "${{ matrix.target_triple }}" \
+            "${{ matrix.target_name }}" \
+            "dist/release"
+
+      - name: Stage artifacts (linux)
+        if: runner.os == 'Linux'
+        run: |
+          ./scripts/release/stage-linux.sh \
+            "${{ matrix.target_triple }}" \
+            "${{ matrix.target_name }}" \
+            "dist/release"
+
+      - name: Stage artifacts (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          ./scripts/release/stage-windows.sh \
+            "${{ matrix.target_triple }}" \
+            "${{ matrix.target_name }}" \
+            "dist/release"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: launcher-${{ matrix.target_name }}
+          path: dist/release/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source from ${{ env.SOURCE_REPO }} (for manifest scripts)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref:        ${{ env.SOURCE_SHA }}
+          token:      ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/release
+          merge-multiple: true
+
+      - name: Inspect staged artifacts
+        run: ls -la dist/release
+
+      - name: Generate manifest
+        run: |
+          python3 scripts/release/make-manifest.py \
+            --version "${VERSION#v}" \
+            --channel "$CHANNEL" \
+            --commit  "$SOURCE_SHA" \
+            --release-notes "Dreams Launcher $TAG" \
+            --min-launcher-version 0.0.0 \
+            --artifacts-dir dist/release \
+            --download-base "https://github.com/${{ github.repository }}/releases/download/$TAG/" \
+            --out dist/release/manifest.json
+          cat dist/release/manifest.json
+
+      - name: Sign manifest
+        if: env.MANIFEST_SIGNING_KEY != ''
+        env:
+          MANIFEST_SIGNING_KEY: ${{ secrets.MANIFEST_SIGNING_KEY }}
+        run: |
+          echo "$MANIFEST_SIGNING_KEY" | base64 -d > /tmp/key.ed25519
+          chmod 600 /tmp/key.ed25519
+          bash scripts/release/sign-manifest.sh dist/release/manifest.json /tmp/key.ed25519
+          rm -f /tmp/key.ed25519
+
+      - name: Publish versioned release ${{ env.TAG }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PRERELEASE_FLAG=""
+          if [ "$CHANNEL" = "dev" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "$TAG" \
+            --target "$SOURCE_SHA" \
+            --title  "Dreams Launcher $TAG" \
+            --notes  "Automated release for channel: $CHANNEL (source $SOURCE_SHA)" \
+            $PRERELEASE_FLAG \
+            dist/release/* \
+          || gh release upload "$TAG" --clobber dist/release/*
+
+      - name: Move rolling tag latest-${{ env.CHANNEL }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ROLLING="latest-$CHANNEL"
+          gh release delete "$ROLLING" --yes --cleanup-tag || true
+          cp dist/release/manifest.json dist/release/latest.json
+          gh release create "$ROLLING" \
+            --target "$SOURCE_SHA" \
+            --title  "Latest $CHANNEL" \
+            --notes  "Rolling pointer to $TAG. Updater fetches latest.json from here." \
+            --prerelease \
+            dist/release/latest.json
