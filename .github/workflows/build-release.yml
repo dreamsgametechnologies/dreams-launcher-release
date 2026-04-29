@@ -189,6 +189,22 @@ jobs:
           export BUILD_DATE="$(date -u +%F)"
           echo "==> channel=$CHANNEL  env=$ENV_FILE  firebase=$FIREBASE_PROJECT_ID"
 
+          # Diagnostic: confirm the signing secret survived the env-block
+          # → run-shell handoff. GitHub auto-masks the value in logs, so
+          # we only print byte length. This isolates Cause 1 ("env-block
+          # didn't propagate") from a Tauri-side silent skip ("key
+          # arrived but bundler still didn't sign").
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY missing inside build step shell — env-block didn't propagate"
+            exit 1
+          fi
+          echo "==> TAURI_SIGNING_PRIVATE_KEY present (${#TAURI_SIGNING_PRIVATE_KEY} bytes)"
+          # Re-export so child processes (yarn → tauri → tauri-bundler)
+          # definitely see them. Belt-and-braces: GitHub's env-block
+          # already exports them, but this removes any doubt.
+          export TAURI_SIGNING_PRIVATE_KEY
+          export TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+
           # Tauri exits 0 even when DMG bundling fails (it considers the
           # .app a success) — bundle_dmg.sh sometimes flakes on macOS
           # AppleScript / hdiutil timing in CI, leaving no .dmg behind
@@ -198,12 +214,18 @@ jobs:
           # enough that the verify is just a sanity check.
           BUNDLE_DIR="src-tauri/target/${{ matrix.target_triple }}/release/bundle"
           case "${{ runner.os }}" in
-            macOS)   EXPECT_GLOB="$BUNDLE_DIR/dmg/*.dmg" ;;
-            Linux)   EXPECT_GLOB="$BUNDLE_DIR/appimage/*.AppImage" ;;
-            Windows) EXPECT_GLOB="$BUNDLE_DIR/msi/*.msi" ;;
+            macOS)   EXPECT_GLOB="$BUNDLE_DIR/dmg/*.dmg"           ; BUNDLES="app,dmg,updater" ;;
+            Linux)   EXPECT_GLOB="$BUNDLE_DIR/appimage/*.AppImage" ; BUNDLES="appimage,deb,updater" ;;
+            Windows) EXPECT_GLOB="$BUNDLE_DIR/msi/*.msi"           ; BUNDLES="msi,nsis,updater" ;;
           esac
+          # Naming `updater` explicitly in --bundles forces the bundler
+          # to produce the .tar.gz / .msi.zip + .sig pairs even if a
+          # bundle.targets="all" config interpretation would otherwise
+          # silently exclude them. If the CLI rejects `updater` as not a
+          # bundle target name, the build errors with a clear message
+          # — strictly better than the current silent skip.
           attempt() {
-            yarn tauri build --target ${{ matrix.target_triple }} "${EXTRA_ARGS[@]}"
+            yarn tauri build --target ${{ matrix.target_triple }} --bundles "$BUNDLES" "${EXTRA_ARGS[@]}"
             compgen -G "$EXPECT_GLOB" >/dev/null
           }
           if ! attempt; then
