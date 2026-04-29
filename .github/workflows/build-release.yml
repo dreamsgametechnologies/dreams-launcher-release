@@ -74,7 +74,16 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src-tauri/target
-          key: ${{ runner.os }}-${{ matrix.target_triple }}-launcher-${{ hashFiles('src-tauri/Cargo.lock') }}
+          # Cache key includes .env.* hashes because the launcher reads
+          # several of those vars via option_env! (UPDATER_ENDPOINT_BASE,
+          # FIREBASE_PROJECT_ID, BUILD_CHANNEL, BUILD_DATE — see
+          # src-tauri/src/build_info.rs and crashes.rs). Cargo doesn't
+          # track option_env! in its fingerprint, so without this any env
+          # change leaves stale .o files with the previous values baked
+          # in (and the resulting binary fetches the wrong URLs / silent-
+          # fails). Bumping a key like 'v2' below force-invalidates the
+          # cache after a workflow change too.
+          key: ${{ runner.os }}-${{ matrix.target_triple }}-launcher-v2-${{ hashFiles('src-tauri/Cargo.lock', '.env.development', '.env.production') }}
 
       - name: Install Linux build deps
         if: runner.os == 'Linux'
