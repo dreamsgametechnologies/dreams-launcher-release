@@ -126,7 +126,7 @@ jobs:
         run: |
           if [[ "$CHANNEL" == "dev" ]]; then
             ENV_FILE=".env.development"
-            EXTRA_ARGS=(-- --features dev-features)
+            EXTRA_ARGS=(--features dev-features)
           else
             ENV_FILE=".env.production"
             EXTRA_ARGS=(--config src-tauri/tauri.conf.prod.json)
