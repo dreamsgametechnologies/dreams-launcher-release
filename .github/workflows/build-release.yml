@@ -107,6 +107,14 @@ jobs:
         shell: bash
         env:
           CHANNEL: ${{ env.CHANNEL }}
+          # Sign the updater bundles (.app.tar.gz / .AppImage.tar.gz /
+          # .msi.zip) inside `tauri build` itself — Tauri picks these up
+          # automatically when plugins.updater.pubkey is set in
+          # tauri.conf.json. The launcher refuses to apply an unsigned
+          # update bundle, so a missing secret would silently produce
+          # binaries that can never self-update.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         # Mirrors what scripts/build.sh does locally: source the matching
         # .env.<mode> so VITE_FIREBASE_* and UPDATER_ENDPOINT_BASE are in
         # process env at vite-build time (without these, firebase.ts
@@ -133,6 +141,10 @@ jobs:
           fi
           if [[ ! -f "$ENV_FILE" ]]; then
             echo "::error::$ENV_FILE not found in checkout — verify it's committed in the source repo"
+            exit 1
+          fi
+          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY secret is unset on dreams-launcher-release. Without it, tauri build cannot sign the updater bundles and the launcher's self-update will refuse to apply them."
             exit 1
           fi
           set -a
@@ -238,30 +250,21 @@ jobs:
         run: ls -la dist/release
 
       - name: Generate manifest
+        # tauri-plugin-updater format. Tauri's bundler already produced
+        # one minisign signature per platform bundle (.app.tar.gz.sig /
+        # .AppImage.tar.gz.sig / .msi.zip.sig) during `tauri build`, so
+        # this script just reads them and pairs each with the bundle's
+        # download URL. The latest.json itself is unsigned — security
+        # comes from the per-bundle signature being verified by the
+        # launcher against tauri.conf.json's pubkey.
         run: |
           python3 scripts/release/make-manifest.py \
             --version "${VERSION#v}" \
-            --channel "$CHANNEL" \
-            --commit  "$SOURCE_SHA" \
             --release-notes "Dreams Launcher $TAG" \
-            --min-launcher-version 0.0.0 \
             --artifacts-dir dist/release \
             --download-base "https://github.com/${{ github.repository }}/releases/download/$TAG/" \
             --out dist/release/manifest.json
           cat dist/release/manifest.json
-
-      - name: Sign manifest
-        env:
-          MANIFEST_SIGNING_KEY: ${{ secrets.MANIFEST_SIGNING_KEY }}
-        run: |
-          if [ -z "$MANIFEST_SIGNING_KEY" ]; then
-            echo "::error::MANIFEST_SIGNING_KEY secret is not set on this repo. Refusing to publish an unsigned manifest — the launcher will hard-fail signature verification." >&2
-            exit 1
-          fi
-          echo "$MANIFEST_SIGNING_KEY" | base64 -d > /tmp/key.ed25519
-          chmod 600 /tmp/key.ed25519
-          bash scripts/release/sign-manifest.sh dist/release/manifest.json /tmp/key.ed25519
-          rm -f /tmp/key.ed25519
 
       - name: Publish versioned release ${{ env.TAG }}
         env:
@@ -282,15 +285,17 @@ jobs:
       - name: Move rolling tag latest-${{ env.CHANNEL }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # tauri-plugin-updater polls only latest.json on this rolling
+        # release. The per-platform .sig files live INSIDE the versioned
+        # release and are referenced by URL from latest.json — no need
+        # to copy a manifest .sig here anymore.
         run: |
           ROLLING="latest-$CHANNEL"
           gh release delete "$ROLLING" --repo "${{ github.repository }}" --yes --cleanup-tag || true
-          cp dist/release/manifest.json     dist/release/latest.json
-          cp dist/release/manifest.json.sig dist/release/latest.json.sig
+          cp dist/release/manifest.json dist/release/latest.json
           gh release create "$ROLLING" \
             --repo  "${{ github.repository }}" \
             --title "Latest $CHANNEL" \
-            --notes "Rolling pointer to $TAG. Updater fetches latest.json + latest.json.sig from here." \
+            --notes "Rolling pointer to $TAG. tauri-plugin-updater fetches latest.json from here." \
             --prerelease \
-            dist/release/latest.json \
-            dist/release/latest.json.sig
+            dist/release/latest.json
