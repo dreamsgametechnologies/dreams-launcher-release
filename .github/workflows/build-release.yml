@@ -181,10 +181,13 @@ jobs:
           cat dist/release/manifest.json
 
       - name: Sign manifest
-        if: env.MANIFEST_SIGNING_KEY != ''
         env:
           MANIFEST_SIGNING_KEY: ${{ secrets.MANIFEST_SIGNING_KEY }}
         run: |
+          if [ -z "$MANIFEST_SIGNING_KEY" ]; then
+            echo "::error::MANIFEST_SIGNING_KEY secret is not set on this repo. Refusing to publish an unsigned manifest — the launcher will hard-fail signature verification." >&2
+            exit 1
+          fi
           echo "$MANIFEST_SIGNING_KEY" | base64 -d > /tmp/key.ed25519
           chmod 600 /tmp/key.ed25519
           bash scripts/release/sign-manifest.sh dist/release/manifest.json /tmp/key.ed25519
@@ -212,10 +215,12 @@ jobs:
         run: |
           ROLLING="latest-$CHANNEL"
           gh release delete "$ROLLING" --repo "${{ github.repository }}" --yes --cleanup-tag || true
-          cp dist/release/manifest.json dist/release/latest.json
+          cp dist/release/manifest.json     dist/release/latest.json
+          cp dist/release/manifest.json.sig dist/release/latest.json.sig
           gh release create "$ROLLING" \
             --repo  "${{ github.repository }}" \
             --title "Latest $CHANNEL" \
-            --notes "Rolling pointer to $TAG. Updater fetches latest.json from here." \
+            --notes "Rolling pointer to $TAG. Updater fetches latest.json + latest.json.sig from here." \
             --prerelease \
-            dist/release/latest.json
+            dist/release/latest.json \
+            dist/release/latest.json.sig
