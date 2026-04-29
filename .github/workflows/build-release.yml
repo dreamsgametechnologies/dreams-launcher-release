@@ -143,7 +143,37 @@ jobs:
           export BUILD_CHANNEL="$CHANNEL"
           export BUILD_DATE="$(date -u +%F)"
           echo "==> channel=$CHANNEL  env=$ENV_FILE  firebase=$FIREBASE_PROJECT_ID"
-          yarn tauri build --target ${{ matrix.target_triple }} "${EXTRA_ARGS[@]}"
+
+          # Tauri exits 0 even when DMG bundling fails (it considers the
+          # .app a success) — bundle_dmg.sh sometimes flakes on macOS
+          # AppleScript / hdiutil timing in CI, leaving no .dmg behind
+          # and a stale /Volumes/dmg.* mount. Mirror the retry logic in
+          # scripts/build.sh: build, verify expected artifact, clean up
+          # and retry once if missing. Linux/Windows builds are robust
+          # enough that the verify is just a sanity check.
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target_triple }}/release/bundle"
+          case "${{ runner.os }}" in
+            macOS)   EXPECT_GLOB="$BUNDLE_DIR/dmg/*.dmg" ;;
+            Linux)   EXPECT_GLOB="$BUNDLE_DIR/appimage/*.AppImage" ;;
+            Windows) EXPECT_GLOB="$BUNDLE_DIR/msi/*.msi" ;;
+          esac
+          attempt() {
+            yarn tauri build --target ${{ matrix.target_triple }} "${EXTRA_ARGS[@]}"
+            compgen -G "$EXPECT_GLOB" >/dev/null
+          }
+          if ! attempt; then
+            echo "==> Expected artifact missing ($EXPECT_GLOB); cleaning up and retrying once"
+            if [[ "${{ runner.os }}" == "macOS" ]]; then
+              mount | grep -oE '/Volumes/dmg\.[A-Za-z0-9]+' \
+                | xargs -I{} hdiutil detach {} -force >/dev/null 2>&1 || true
+              rm -f "$BUNDLE_DIR/macos/rw."*".dmg" 2>/dev/null || true
+            fi
+            if ! attempt; then
+              echo "::error::tauri build did not produce $EXPECT_GLOB after two attempts"
+              ls -la "$BUNDLE_DIR" || true
+              exit 1
+            fi
+          fi
         # NOTE: bootstrapper build step intentionally dropped. We ship a
         # Unity-Hub-style installer (.dmg / .msi / .AppImage) and the
         # in-launcher updater (src-tauri/src/updater.rs) handles
