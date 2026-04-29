@@ -95,18 +95,46 @@ jobs:
       - run: corepack enable && yarn install --frozen-lockfile
 
       - name: Build launcher bundle (Tauri)
+        shell: bash
         env:
-          BUILD_CHANNEL: ${{ env.CHANNEL }}
-        # `yarn tauri build` runs the configured beforeBuildCommand
-        # (vite build of the frontend), then cargo builds the Rust
-        # binary, then bundles the platform-native installer:
-        #   macOS:   .app + .dmg under src-tauri/target/<triple>/release/bundle/{macos,dmg}/
-        #   Linux:   .AppImage + .deb under bundle/{appimage,deb}/
-        #   Windows: .msi under bundle/msi/
-        # Plain `cargo build` only produces the raw binary and skips
-        # bundling — which is why earlier runs shipped a tar.gz of two
-        # raw exes instead of installers.
-        run: yarn tauri build --target ${{ matrix.target_triple }}
+          CHANNEL: ${{ env.CHANNEL }}
+        # Mirrors what scripts/build.sh does locally: source the matching
+        # .env.<mode> so VITE_FIREBASE_* and UPDATER_ENDPOINT_BASE are in
+        # process env at vite-build time (without these, firebase.ts
+        # throws on import and the webview shows a black screen). Mirror
+        # VITE_FIREBASE_PROJECT_ID into FIREBASE_PROJECT_ID for Cargo's
+        # option_env! readers in crashes.rs / build_info.rs. Pass
+        # --features dev-features for dev channel so the dev-only Tauri
+        # commands compile in; apply the prod tauri.conf overlay (which
+        # disables devtools) for stable channel.
+        #
+        # `shell: bash` ensures Git Bash on the windows-latest runner so
+        # `source` and `set -a` work uniformly across all three matrix
+        # targets.
+        #
+        # `yarn tauri build` runs beforeBuildCommand (yarn build), then
+        # cargo, then platform-native bundling (.dmg / .msi / .AppImage).
+        run: |
+          if [[ "$CHANNEL" == "dev" ]]; then
+            ENV_FILE=".env.development"
+            EXTRA_ARGS=(-- --features dev-features)
+          else
+            ENV_FILE=".env.production"
+            EXTRA_ARGS=(--config src-tauri/tauri.conf.prod.json)
+          fi
+          if [[ ! -f "$ENV_FILE" ]]; then
+            echo "::error::$ENV_FILE not found in checkout — verify it's committed in the source repo"
+            exit 1
+          fi
+          set -a
+          # shellcheck disable=SC1090
+          source "$ENV_FILE"
+          set +a
+          export FIREBASE_PROJECT_ID="$VITE_FIREBASE_PROJECT_ID"
+          export BUILD_CHANNEL="$CHANNEL"
+          export BUILD_DATE="$(date -u +%F)"
+          echo "==> channel=$CHANNEL  env=$ENV_FILE  firebase=$FIREBASE_PROJECT_ID"
+          yarn tauri build --target ${{ matrix.target_triple }} "${EXTRA_ARGS[@]}"
         # NOTE: bootstrapper build step intentionally dropped. We ship a
         # Unity-Hub-style installer (.dmg / .msi / .AppImage) and the
         # in-launcher updater (src-tauri/src/updater.rs) handles
