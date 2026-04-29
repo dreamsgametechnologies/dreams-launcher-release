@@ -62,6 +62,36 @@ jobs:
           ref:        ${{ env.SOURCE_SHA }}
           token:      ${{ secrets.SOURCE_REPO_TOKEN }}
 
+      - name: Materialize env files from secrets
+        shell: bash
+        env:
+          ENV_DEVELOPMENT_FILE: ${{ secrets.ENV_DEVELOPMENT_FILE }}
+          ENV_PRODUCTION_FILE:  ${{ secrets.ENV_PRODUCTION_FILE }}
+        # Both files are written every run regardless of channel — the
+        # cargo cache key hashes their contents (see Cache step below),
+        # and missing one would silently change the key and skip
+        # otherwise-valid caches. Trailing newline normalized so a
+        # paste with/without one produces the same hash. Overwrites
+        # any committed copy in A's checkout — by design, since these
+        # are the source of truth post-migration.
+        run: |
+          if [[ -z "${ENV_DEVELOPMENT_FILE:-}" || -z "${ENV_PRODUCTION_FILE:-}" ]]; then
+            echo "::error::ENV_DEVELOPMENT_FILE / ENV_PRODUCTION_FILE secrets are not set on this repo. Refusing to build with empty env — Vite would emit JS that throws on Firebase init at app start, producing a black-screen build."
+            exit 1
+          fi
+          printf '%s\n' "$ENV_DEVELOPMENT_FILE" > .env.development
+          printf '%s\n' "$ENV_PRODUCTION_FILE"  > .env.production
+          # Sanity-check: each file must contain the canonical Vite
+          # Firebase keys + the updater endpoint, so a typo in the
+          # secret content doesn't ship a broken build.
+          for f in .env.development .env.production; do
+            for k in VITE_FIREBASE_API_KEY VITE_FIREBASE_PROJECT_ID UPDATER_ENDPOINT_BASE; do
+              grep -q "^${k}=" "$f" || { echo "::error::$f missing $k"; exit 1; }
+            done
+          done
+          echo "==> wrote $(wc -l <.env.development) lines to .env.development"
+          echo "==> wrote $(wc -l <.env.production) lines to .env.production"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -81,9 +111,12 @@ jobs:
           # track option_env! in its fingerprint, so without this any env
           # change leaves stale .o files with the previous values baked
           # in (and the resulting binary fetches the wrong URLs / silent-
-          # fails). Bumping a key like 'v2' below force-invalidates the
-          # cache after a workflow change too.
-          key: ${{ runner.os }}-${{ matrix.target_triple }}-launcher-v2-${{ hashFiles('src-tauri/Cargo.lock', '.env.development', '.env.production') }}
+          # fails). CHANNEL is in the key too because dev and stable
+          # builds bake different option_env! values from the different
+          # .env files; sharing cache between them would cross-poison.
+          # Bumping the version segment (v3) force-invalidates older
+          # caches that lacked the channel segment.
+          key: ${{ runner.os }}-${{ matrix.target_triple }}-${{ env.CHANNEL }}-launcher-v3-${{ hashFiles('src-tauri/Cargo.lock', '.env.development', '.env.production') }}
 
       - name: Install Linux build deps
         if: runner.os == 'Linux'
