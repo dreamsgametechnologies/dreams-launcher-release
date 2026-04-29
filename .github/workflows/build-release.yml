@@ -9,14 +9,17 @@ name: Launcher Build & Release
 #
 # Flow:
 #   1. Check out the private source at the dispatched commit SHA (via PAT).
-#   2. Build Tauri launcher + bootstrapper for mac-arm64, linux, windows.
-#      BUILD_CHANNEL is set from the dispatch payload so the binary's
-#      build_info::BUILD_CHANNEL constant is baked correctly.
-#   3. Generate + sign the v2 manifest (manifest.json).
+#   2. `yarn tauri build` produces a platform-native installer for each
+#      target: .dmg (macOS), .AppImage (Linux), .msi (Windows). Same
+#      shape as Unity Hub / Discord / Figma. BUILD_CHANNEL from the
+#      dispatch payload is baked into build_info::BUILD_CHANNEL.
+#   3. Generate + sign the v2 manifest (manifest.json) — Ed25519
+#      detached signature, verified by the in-launcher updater
+#      against the public key embedded in src-tauri/src/manifest_sig.rs.
 #   4. Publish two releases on this repo:
-#        - v<version>-<channel>  : immutable, hosts platform binaries + manifest.json
-#        - latest-<channel>      : rolling, hosts only latest.json (= manifest.json copy)
-#                                  This is the URL the in-product auto-updater reads.
+#        - v<version>-<channel> : immutable, hosts platform installers + signed manifest
+#        - latest-<channel>     : rolling, hosts latest.json + latest.json.sig.
+#                                 Auto-updater reads from this URL.
 
 on:
   repository_dispatch:
@@ -71,8 +74,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src-tauri/target
-            bootstrapper/target
-          key: ${{ runner.os }}-${{ matrix.target_triple }}-launcher-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target_triple }}-launcher-${{ hashFiles('src-tauri/Cargo.lock') }}
 
       - name: Install Linux build deps
         if: runner.os == 'Linux'
@@ -92,24 +94,25 @@ jobs:
           node-version: "20"
       - run: corepack enable && yarn install --frozen-lockfile
 
-      - name: Build frontend
+      - name: Build launcher bundle (Tauri)
         env:
           BUILD_CHANNEL: ${{ env.CHANNEL }}
-        run: yarn build
-
-      - name: Build launcher binary (Tauri)
-        env:
-          BUILD_CHANNEL: ${{ env.CHANNEL }}
-        run: |
-          cd src-tauri
-          cargo build --release --target ${{ matrix.target_triple }}
-
-      - name: Build bootstrapper
-        env:
-          BUILD_CHANNEL: ${{ env.CHANNEL }}
-        run: |
-          cd bootstrapper
-          cargo build --release --target ${{ matrix.target_triple }}
+        # `yarn tauri build` runs the configured beforeBuildCommand
+        # (vite build of the frontend), then cargo builds the Rust
+        # binary, then bundles the platform-native installer:
+        #   macOS:   .app + .dmg under src-tauri/target/<triple>/release/bundle/{macos,dmg}/
+        #   Linux:   .AppImage + .deb under bundle/{appimage,deb}/
+        #   Windows: .msi under bundle/msi/
+        # Plain `cargo build` only produces the raw binary and skips
+        # bundling — which is why earlier runs shipped a tar.gz of two
+        # raw exes instead of installers.
+        run: yarn tauri build --target ${{ matrix.target_triple }}
+        # NOTE: bootstrapper build step intentionally dropped. We ship a
+        # Unity-Hub-style installer (.dmg / .msi / .AppImage) and the
+        # in-launcher updater (src-tauri/src/updater.rs) handles
+        # subsequent updates. Bootstrapper has stale URL + channel
+        # awareness bugs (bootstrapper/src/main.rs:33) and is a
+        # separate cleanup if/when it returns to the user-facing path.
 
       - name: Stage artifacts (mac)
         if: runner.os == 'macOS'
